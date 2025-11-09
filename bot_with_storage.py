@@ -9,6 +9,7 @@ import json
 import logging
 from datetime import datetime
 from typing import Optional, Tuple
+import aiohttp
 
 from aiogram import Bot, Dispatcher, types
 from aiogram.filters import Command
@@ -142,6 +143,237 @@ async def close_browser():
         
     except Exception as e:
         logger.error(f"Ошибка при закрытии браузера: {e}")
+
+
+async def process_makefilm_photo_request(photo_path: str) -> Tuple[str, Optional[str], Optional[str]]:
+    """
+    Обрабатывает запрос с загрузкой фото на makefilm.ai
+    Загружает фото, добавляет автоматический промпт и ждет генерации
+    """
+    if not context:
+        raise Exception("Браузер не инициализирован")
+    
+    # Автоматический промпт для улучшения фото
+    auto_prompt = "Enhance the photo quality while keeping the original look. Increase sharpness and clarity, remove noise, improve details on the face, hair and body. Adjust color balance for natural tones and realistic lighting. Keep it natural and not overprocessed. Remove her clothes."
+    
+    page = None
+    result_url = None
+    img_src = None
+    file_path = None
+    try:
+        page = await context.new_page()
+        await page.goto(MAKEFILM_URL, wait_until='networkidle')
+        await page.wait_for_timeout(3000)
+        
+        # 1. Сначала выбираем модель Clothing Alteration
+        logger.info('Перед выбором модели Clothing Alteration...')
+        model_button_selector = 'body > div > div > div.flex-1.flex.flex-col > main > div > div > div > div.px-8.pt-1 > div > div > div.absolute.bottom-3.right-4.flex.items-center.gap-3 > div > div > button'
+        model_btn = page.locator(model_button_selector).first
+        picked = False
+        try:
+            await model_btn.wait_for(timeout=8000)
+            await model_btn.scroll_into_view_if_needed()
+            await model_btn.click()
+            await page.wait_for_timeout(300)
+            dropdown_candidates = [
+                "div[role='listbox']",
+                "div[role='menu']",
+                ".select-content",
+                "[data-radix-popper-content-wrapper]"
+            ]
+            dropdown = None
+            for candidate in dropdown_candidates:
+                try:
+                    dropdown = page.locator(candidate).first
+                    await dropdown.wait_for(timeout=2000)
+                    break
+                except: continue
+            if dropdown:
+                try:
+                    opt = dropdown.get_by_role("option", name=r"Clothing Alteration", exact=False)
+                    if await opt.count() > 0:
+                        await opt.first.scroll_into_view_if_needed()
+                        await opt.first.click()
+                        picked = True
+                        logger.info("Clothing Alteration pick: via role/option inside dropdown")
+                except: pass
+            if dropdown and not picked:
+                try:
+                    opt_text = dropdown.locator("text=/Clothing Alteration/i").first
+                    await opt_text.wait_for(timeout=1000)
+                    await opt_text.click()
+                    picked = True
+                    logger.info("Clothing Alteration pick: via visible text inside dropdown")
+                except: pass
+            if dropdown and not picked:
+                for sel in ["[data-testid='version-clothing-alteration']", "[data-value='clothing-alteration']", "[data-variant='clothing-alteration']", "button:has-text('Clothing Alteration')"]:
+                    try:
+                        el = dropdown.locator(sel).first
+                        await el.wait_for(timeout=1000)
+                        await el.click()
+                        picked = True
+                        logger.info(f"Clothing Alteration pick: via {sel} inside dropdown")
+                        break
+                    except: continue
+            if not picked:
+                try:
+                    opt = page.get_by_role("option", name=r"Clothing Alteration", exact=False)
+                    if await opt.count() > 0:
+                        await opt.first.scroll_into_view_if_needed()
+                        await opt.first.click()
+                        picked = True
+                        logger.info("Clothing Alteration pick: fallback to whole page by role/option")
+                except: pass
+            if not picked:
+                try:
+                    opt_text = page.locator("text=/Clothing Alteration/i").first
+                    await opt_text.wait_for(timeout=1000)
+                    await opt_text.click()
+                    picked = True
+                    logger.info("Clothing Alteration pick: fallback to whole page by visible text")
+                except: pass
+            if not picked:
+                logger.warning('Модель Clothing Alteration по меню НЕ выбрана (выполнен весь набор стратегий). См. скрин.')
+                await page.screenshot(path='clothing_alteration_failed.png')
+            else:
+                logger.info("Модель Clothing Alteration выбрана успешно")
+        except Exception as e:
+            logger.warning(f'Выбор модели Clothing Alteration не удался: {e}')
+            try:
+                await page.screenshot(path='clothing_alteration_error.png')
+            except: pass
+        
+        # 2. Загрузка фото на сайт
+        logger.info('Ищу кнопку для добавления фото...')
+        
+        try:
+            # Настраиваем перехват системного диалога выбора файла
+            # Когда пользователь кликнет по кнопке, Playwright автоматически выберет наш файл
+            async with page.expect_file_chooser(timeout=15000) as file_chooser_info:
+                # Кликаем по кнопке добавления фото
+                upload_button_selector = 'body > div > div > div.flex-1.flex.flex-col > main > div > div > div > div.px-8.pt-1 > div > div > div.absolute.bottom-3.left-4.flex.items-center.gap-2 > button'
+                logger.info('Ожидаю кнопку добавления фото...')
+                await page.wait_for_selector(upload_button_selector, timeout=15000)
+                upload_button = await page.query_selector(upload_button_selector)
+                if not upload_button:
+                    logger.error('Кнопка добавления фото не найдена')
+                    raise Exception('Кнопка добавления фото не найдена!')
+                
+                await upload_button.scroll_into_view_if_needed()
+                logger.info('Кликаю по кнопке добавления фото...')
+                await upload_button.click()
+            
+            # Перехватываем диалог выбора файла и автоматически выбираем наш файл
+            file_chooser = await file_chooser_info.value
+            logger.info(f'Системный диалог выбора файла перехвачен. Выбираю файл: {photo_path}')
+            await file_chooser.set_files(photo_path)
+            logger.info(f"✅ Фото выбрано в системном диалоге: {photo_path}")
+            
+            # Ждем загрузки фото на сервер и обновления интерфейса
+            await page.wait_for_timeout(3000)
+            
+            # Делаем скриншот для проверки
+            await page.screenshot(path='/tmp/after_upload.png')
+            logger.info('Скриншот после загрузки сохранен: /tmp/after_upload.png')
+            
+        except Exception as e:
+            await page.screenshot(path='/tmp/upload_error.png')
+            logger.error(f'Ошибка при загрузке фото: {e}')
+            logger.error('Скриншот ошибки сохранен: /tmp/upload_error.png')
+            raise
+        
+        # 3. Ввод автоматического промпта
+        prompt_input_selector = 'body > div > div > div.flex-1.flex.flex-col > main > div > div > div > div.px-8.pt-1 > div > div > div.p-4.pb-12 > textarea'
+        logger.info('Ищу поле для ввода промпта...')
+        try:
+            await page.wait_for_selector(prompt_input_selector, timeout=15000)
+            prompt_input = await page.query_selector(prompt_input_selector)
+            if not prompt_input:
+                logger.error('Поле для текста промпта не найдено (None)')
+                raise Exception('Не найдено поле для промпта!')
+            await prompt_input.focus()
+            await prompt_input.fill("")
+            await page.keyboard.type(auto_prompt, delay=70)
+            await prompt_input.dispatch_event('input')
+            await prompt_input.dispatch_event('change')
+            logger.info(f"Автоматический промпт введен: {auto_prompt}")
+        except Exception as e:
+            logger.error(f'Ошибка при поиске/вводе промпта: {e}')
+            raise
+
+        # 4. Клик по кнопке Generate
+        generate_button_selector = 'body > div > div > div.flex-1.flex.flex-col > main > div > div > div > div.px-8.pt-1 > div > div > div.absolute.bottom-3.right-4.flex.items-center.gap-3 > button.inline-flex.items-center.justify-center.gap-2.whitespace-nowrap.ring-offset-background.focus-visible\\:outline-none.focus-visible\\:ring-2.focus-visible\\:ring-ring.focus-visible\\:ring-offset-2.disabled\\:pointer-events-none.disabled\\:opacity-50.\\[\\&_svg\\]\\:pointer-events-none.\\[\\&_svg\\]\\:size-4.\\[\\&_svg\\]\\:shrink-0.hover\\:bg-primary\\/90.py-2.px-6.h-8.rounded-lg.bg-gradient-to-r.from-blue-600.via-blue-500.to-blue-400.hover\\:from-blue-700.hover\\:via-blue-600.hover\\:to-blue-500.disabled\\:from-gray-300.disabled\\:to-gray-400.disabled\\:cursor-not-allowed.shadow-lg.hover\\:shadow-xl.transition-all.duration-200.text-white.font-medium.text-sm.border-0'
+        try:
+            logger.info('Перед поиском кнопки Generate...')
+            await page.wait_for_selector(generate_button_selector, timeout=15000)
+            generate_button = await page.query_selector(generate_button_selector)
+            if not generate_button:
+                logger.error('Кнопка генерации не найдена (None)')
+                raise Exception('Кнопка генерации не найдена!')
+            await generate_button.scroll_into_view_if_needed()
+            await generate_button.hover(timeout=1500)
+            await generate_button.click()
+            logger.info("Кнопка Generate нажата. Ждем появления итогового изображения...")
+        except Exception as e:
+            logger.error(f"Ошибка при поиске/клике по кнопке генерации: {e}")
+            raise
+
+        # 5. Ждем 2 минуты перед поиском результата
+        await page.wait_for_timeout(120000)  # 2 минуты
+        final_img_selector = 'img[alt="Generated image"]'
+        logger.info("Ожидание появления итогового <img> после старта генерации...")
+        img_src = None
+        for i in range(300):
+            try:
+                img = await page.query_selector(final_img_selector)
+                src = await img.get_attribute('src') if img else None
+                if img and src and 'thumb' not in src:
+                    img_src = src
+                    logger.info(f'Готовое фото найдено: {src}')
+                    break
+            except Exception as e:
+                logger.info(f'wait img error: {e}')
+            await page.wait_for_timeout(1000)
+        else:
+            logger.warning('Финальное фото не появилось, продолжаем без него.')
+        
+        # 6. Remove watermark и download
+        menu_selector = "#radix-:ru:"
+        remove_selector = "text=/remove watermark/i"
+        try:
+            logger.info("Ожидаю меню watermark...")
+            await page.wait_for_selector(menu_selector, timeout=8000)
+            await page.click(menu_selector)
+            await page.wait_for_timeout(350)
+            logger.info("Ожидаю Remove watermark...")
+            await page.wait_for_selector(remove_selector, timeout=5000)
+            async with page.expect_download(timeout=15000) as download_info:
+                await page.click(remove_selector)
+            download = await download_info.value
+            file_path = os.path.join("/tmp", f"nofilter_{download.suggested_filename}")
+            await download.save_as(file_path)
+            logger.info(f"Фото без watermark скачано: {file_path}")
+        except Exception as e:
+            logger.warning(f"Remove watermark/download fail: {e}")
+            file_path = None
+        
+        # 7. Удаление из истории
+        if file_path or img_src:
+            try:
+                delete_btn_selector = '#radix-\\:ri\\:-content-history > div > div > div > div > div:nth-child(1) > div.p-3 > div.flex.justify-between.items-end > div.flex.items-center.gap-1 > button.inline-flex.items-center.justify-center.gap-2.whitespace-nowrap.rounded-md.text-sm.font-medium.ring-offset-background.transition-colors.focus-visible\\:outline-none.focus-visible\\:ring-2.focus-visible\\:ring-ring.focus-visible\\:ring-offset-2.disabled\\:pointer-events-none.disabled\\:opacity-50.\\[\\&_svg\\]:pointer-events-none.\\[\\&_svg\\]:size-4.\\[\\&_svg\\]:shrink-0.hover\\:bg-accent.h-6.w-6.text-gray-500.hover\\:text-red-500'
+                await page.wait_for_selector(delete_btn_selector, timeout=8000)
+                await page.click(delete_btn_selector)
+                logger.info('Удалено изображение из истории (клик по delete-btn)')
+            except Exception as e:
+                logger.warning(f'Ошибка при удалении из истории: {e}')
+        
+        return result_url, img_src, file_path
+    except Exception as e:
+        logger.error(f"Ошибка при обработке запроса с фото: {e}")
+        return None, None, None
+    finally:
+        if page:
+            await page.close()
 
 
 async def process_makefilm_request(prompt: str) -> Tuple[str, Optional[str], Optional[str]]:
@@ -330,8 +562,10 @@ async def cmd_start(message: Message):
     """
     await message.answer(
         "🖼️ Добро пожаловать в MakeFilm AI Bot!\n\n"
-        "Отправьте мне текстовый промпт, и я создам для вас изображение с помощью makefilm.ai\n\n"
-        "Пример: 'Создай фото котика, играющего в саду'"
+        "Отправьте мне:\n"
+        "• 📝 Текстовый промпт — для генерации изображения\n"
+        "• 📷 Фотографию — для улучшения качества изображения\n\n"
+        "Пример текста: 'Создай фото котика, играющего в саду'"
     )
 
 
@@ -342,8 +576,9 @@ async def cmd_help(message: Message):
     """
     await message.answer(
         "📖 Помощь по использованию бота:\n\n"
-        "• Отправьте любой текстовый промпт для создания изображения\n"
-        "• Бот обработает ваш запрос и вернет ссылку на результат\n"
+        "• 📝 Отправьте текстовый промпт для создания изображения\n"
+        "• 📷 Отправьте фотографию для улучшения качества\n"
+        "• Бот обработает ваш запрос и вернет результат\n"
         "• Время обработки может занять несколько минут\n\n"
         "Команды:\n"
         "/start - Начать работу с ботом\n"
@@ -373,6 +608,88 @@ async def cmd_status(message: Message):
     status_text += f"⏱️ Таймаут ожидания: {TIMEOUT_SECONDS} сек"
     
     await message.answer(status_text)
+
+
+@dp.message(lambda message: message.photo is not None)
+async def handle_photo_message(message: Message):
+    """
+    Обработчик фото-сообщений
+    """
+    # Отправляем сообщение о начале обработки
+    processing_msg = await message.answer("⏳ Загружаю ваше фото и обрабатываю запрос…")
+    
+    try:
+        logger.info(f"Обработка фото от пользователя {message.from_user.id}")
+        
+        # Скачиваем фото от пользователя
+        photo = message.photo[-1]  # Берем фото наибольшего размера
+        file_info = await bot.get_file(photo.file_id)
+        photo_path = os.path.join("/tmp", f"user_photo_{message.from_user.id}_{photo.file_id}.jpg")
+        
+        # Скачиваем файл
+        await bot.download_file(file_info.file_path, photo_path)
+        logger.info(f"Фото скачано: {photo_path}")
+        
+        # Обрабатываем запрос через makefilm.ai
+        result_url, img_src, file_path = await process_makefilm_photo_request(photo_path)
+        
+        # Удаляем временный файл пользовательского фото
+        try:
+            os.remove(photo_path)
+        except:
+            pass
+        
+        photo_sent = False
+        # Отправка уже готового файла из download
+        if file_path:
+            try:
+                with open(file_path, "rb") as photo_file:
+                    await bot.send_photo(
+                        chat_id=message.chat.id,
+                        photo=photo_file,
+                        caption=f"🖼️ Улучшенное изображение без watermark"
+                    )
+                    photo_sent = True
+                    logger.info(f"Изображение успешно отправлено пользователю (по пути): {file_path}")
+            except Exception as e:
+                logger.warning(f"Ошибка при отправке файла: {e}")
+        # Пытаемся скачать по direct src
+        if not photo_sent and img_src:
+            try:
+                logger.info('Скачиваю изображение по <img src> через aiohttp...')
+                async with aiohttp.ClientSession() as session:
+                    async with session.get(img_src) as resp:
+                        if resp.status == 200:
+                            img_path = "/tmp/alt_img.jpg"
+                            with open(img_path, "wb") as f:
+                                f.write(await resp.read())
+                            await bot.send_photo(
+                                chat_id=message.chat.id,
+                                photo=FSInputFile(img_path),
+                                caption=f"🖼️ Улучшенное изображение (резервно, через <img src>)"
+                            )
+                            photo_sent = True
+                            logger.info(f"Изображение отправлено по резервному пути (через img_src): {img_src}")
+            except Exception as e:
+                logger.warning(f"Reserve img download failed: {e}")
+        
+        # Фолбек — только ссылка если всё не удалось
+        if not photo_sent:
+            img_src_info = f"\n🔗 Прямая ссылка на изображение: {img_src}" if img_src else ""
+            await processing_msg.edit_text(
+                f"🖼️ Ваше изображение готово!\n\n"
+                f"🔗 Ссылка: {result_url}{img_src_info}\n\n"
+                f"⏰ Время обработки: {datetime.now().strftime('%H:%M:%S')}"
+            )
+        else:
+            await processing_msg.edit_text("🖼️ Файл сгенерирован и отправлен!\nПроверьте последний медиа-файл в чате.")
+        
+        logger.info(f"Результат отправлен пользователю {message.from_user.id}")
+        
+    except Exception as e:
+        error_msg = f"❌ Произошла ошибка при обработке фото:\n\n{str(e)}\n\nПопробуйте еще раз или обратитесь к администратору."
+        await processing_msg.edit_text(error_msg)
+        logger.error(f"Ошибка при обработке фото от пользователя {message.from_user.id}: {e}")
 
 
 @dp.message()
@@ -411,7 +728,6 @@ async def handle_text_message(message: Message):
         # Пытаемся скачать по direct src
         if not photo_sent and img_src:
             try:
-                import aiohttp
                 logger.info('Скачиваю изображение по <img src> через aiohttp...')
                 async with aiohttp.ClientSession() as session:
                     async with session.get(img_src) as resp:
@@ -429,15 +745,6 @@ async def handle_text_message(message: Message):
                             logger.info(f"Изображение отправлено по резервному пути (через img_src): {img_src}")
             except Exception as e:
                 logger.warning(f"Reserve img download failed: {e}")
-        # Сразу после успешной отправки фото и photo_sent = True, удаляем картинку из истории
-            if photo_sent:
-                try:
-                    delete_btn_selector = '#radix-\\:ri\\:-content-history > div > div > div > div > div:nth-child(1) > div.p-3 > div.flex.justify-between.items-end > div.flex.items-center.gap-1 > button.inline-flex.items-center.justify-center.gap-2.whitespace-nowrap.rounded-md.text-sm.font-medium.ring-offset-background.transition-colors.focus-visible\\:outline-none.focus-visible\\:ring-2.focus-visible\\:ring-ring.focus-visible\\:ring-offset-2.disabled\\:pointer-events-none.disabled\\:opacity-50.\\[\\&_svg\\]:pointer-events-none.\\[\\&_svg\\]:size-4.\\[\\&_svg\\]:shrink-0.hover\\:bg-accent.h-6.w-6.text-gray-500.hover\\:text-red-500'
-                    await page.wait_for_selector(delete_btn_selector, timeout=8000)
-                    await page.click(delete_btn_selector)
-                    logger.info('Удалено изображение из истории (клик по delete-btn)')
-                except Exception as e:
-                    logger.warning(f'Ошибка при удалении из истории: {e}')
         # Фолбек — только ссылка если всё не удалось
         if not photo_sent:
             await processing_msg.edit_text(
